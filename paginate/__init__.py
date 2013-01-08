@@ -2,6 +2,7 @@ from restkit import BasicAuth
 from django.conf import settings
 
 from couchdbkit import schema
+from couchdbkit.exceptions import MultipleResultsFound, NoResultFound
 from couchdbkit.resource import CouchdbResource
 from couchdbkit.ext.django import loading
 from couchdbkit.ext.django.schema import DocumentMeta
@@ -64,17 +65,31 @@ class CustomDatabase(Database):
             if doc['id'][0]!='_':
                 yield cls(doc['doc'])
                 
-    def paged_view(self, view_name, page_size=1000, cls=None, **params):
+    def paged_view(self, view_name, page_size, cls=None, **params):
+        if cls:
+            params['include_docs']=True
+            
+        if not page_size:
+            res = self.view(view_name, **params)
+            for r in res:
+                yield r
+            return
+        
         orig_limit = params.get('limit',None)
         yielded = 0
         params['limit']=page_size+1
-        if cls:
-            params['include_docs']=True
+        
         while True:
             if orig_limit is not None:
                 params['limit']=min(orig_limit-yielded,page_size+1)
-            res = list(self.view(view_name, **params))
-            print "CustomDatabase.paged_view: FETCHED: %s"%str(res)
+            #print "CustomDatabase.paged_view(page_size=%s): %s"%(page_size, str(params))
+            
+            view = self.view(view_name, **params)
+            res = list(view)
+                        
+            print (" "*21)+("+"*119)+("> Database.fetch(rows=%s)"%(len(res[0:page_size])))
+            
+            #print "CustomDatabase.paged_view(page_size=%s): FETCHED: %s"%(page_size, str(res))
             for r in res[0:page_size]:
                 if cls:
                     yield cls(r['doc'])
@@ -89,11 +104,11 @@ class CustomDatabase(Database):
             
     def view(self, view_name, schema=None, wrapper=None, **params):
         """ get view results from database. viewname is generally
-        a string like `designname/viewname". It return an ViewResults
+        a string like 'designname/viewname". It return an ViewResults
         object on which you could iterate, list, ... . You could wrap
         results in wrapper function, a wrapper function take a row
         as argument. Wrapping could be also done by passing an Object
-        in obj arguments. This Object should have a `wrap` method
+        in obj arguments. This Object should have a 'wrap' method
         that work like a simple wrapper function.
 
         @param view_name, string could be '_all_docs', '_all_docs_by_seq',
@@ -127,15 +142,93 @@ class CustomViewResults(ViewResults):
         self.orig_wrapper = self.wrapper
         self.wrapper = self.extended_wrapper
         
-    def extended_wrapper(self, row):
+    def extended_wrapper(self, row):        
         result = self.orig_wrapper(row)
         
         #If the result is a Schema, it is no longer a row. Standard CouchDBKit loses the "key" info
         #This makes sure the key info is still available as a "private" attribute
         if isinstance(result, schema.Document):            
-            result['_key'] = row['key']
+            result['_key'] = row['key'] 
+                       
         
         return result
+   
+class GeneratorViewResults(object):
+    """
+    Object to retrieve view results.
+    """
+
+    def __init__(self, generator):
+        """
+        Constructor of GeneratorViewResults object
+
+        @param view: Object inherited from :mod:'couchdbkit.client.view.ViewInterface
+        @param params: params to apply when fetching view.
+
+        """
+        self._generator = generator
+
+    def iterator(self):
+        return self._generator
+
+    def first(self):
+        """
+        Return the first result of this query or None if the result doesn't contain any row.
+        This results in an execution of the underlying query.
+        """
+        try:
+            return list(self)[0]
+        except IndexError:
+            return None
+
+    def one(self, except_all=False):
+        """
+        Return exactly one result or raise an exception.
+
+
+        Raises 'couchdbkit.exceptions.MultipleResultsFound' if multiple rows are returned.
+        If except_all is True, raises 'couchdbkit.exceptions.NoResultFound'
+        if the query selects no rows.
+
+        This results in an execution of the underlying query.
+        """
+
+        length = len(self)
+        if length > 1:
+            raise MultipleResultsFound("%s results found." % length)
+
+        result = self.first()
+        if result is None and except_all:
+            raise NoResultFound
+        return result
+
+    def all(self):
+        """ return list of all results """
+        return list(self.iterator())
+
+    def count(self):
+        """ return number of returned results """
+        return len(all())   
+
+    @property
+    def total_rows(self):
+        """ return number of total rows in the view """
+        # reduce case, count number of lines
+        if self._total_rows is None:
+            self._total_rows = self.count()
+        return self._total_rows
+
+    def __getitem__(self, key):
+        return self.all().__getitem__(key)
+
+    def __iter__(self):
+        return self.iterator()
+
+    def __len__(self):
+        return self.count()
+
+    def __nonzero__(self):
+        return bool(len(self))
          
 customCouchDbkitHandler = CustomCouchdbkitHandler(COUCHDB_DATABASES)
             
@@ -143,7 +236,7 @@ class CustomQueryMixin(object):
     """ Mixin that add query methods """
     
     @classmethod
-    def paged_view(cls, view_name, page_size=None, wrapper=None, dynamic_properties=None,
+    def paged_view(cls, view_name, page_size=1000, wrapper=None, dynamic_properties=None,
     wrap_doc=True, classes=None, **params):
         """ Get documents associated view a view.
         Results of view are automatically wrapped
@@ -157,16 +250,14 @@ class CustomQueryMixin(object):
         used for wrapping. Default is True.
         @params params:  params of view
 
-        @return: :class:`simplecouchdb.core.ViewResults` instance. All
+        @return: :class:'simplecouchdb.core.ViewResults' instance. All
         results are wrapped to current document instance.
-        """
-        #Standard page_size = 1000
-        page_size = page_size or (params["page_size"] if "page_size" in params else 1000) 
-        
+        """        
         db = cls.get_db()
-        return db.paged_view(view_name, page_size=page_size,
-            dynamic_properties=dynamic_properties, wrap_doc=wrap_doc,
-            wrapper=wrapper, schema=classes or cls, **params)
+        return GeneratorViewResults(
+            db.paged_view(view_name, page_size=page_size,
+                          dynamic_properties=dynamic_properties, wrap_doc=wrap_doc,
+                          wrapper=wrapper, schema=classes or cls, **params))
             
 class Document(schema.Document, CustomQueryMixin):
     """ Document object for django extension """

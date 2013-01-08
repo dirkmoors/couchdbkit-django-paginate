@@ -1,8 +1,0 @@
-static
-media
-*.pyc
-.project
-.pydevproject
-.idea
-build
-couchdbext
