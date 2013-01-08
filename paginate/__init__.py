@@ -1,4 +1,6 @@
 from restkit import BasicAuth
+import logging
+
 from django.conf import settings
 
 from couchdbkit import schema
@@ -10,6 +12,8 @@ from couchdbkit.client import Server, Database, ViewResults
 
 COUCHDB_DATABASES = getattr(settings, "COUCHDB_DATABASES", [])
 COUCHDB_TIMEOUT = getattr(settings, "COUCHDB_TIMEOUT", 300)
+
+logger = logging.getLogger('couchdbkit.ext.django.paginate')
 
 class CustomCouchdbkitHandler(loading.CouchdbkitHandler):
     def __init__(self, databases):
@@ -82,14 +86,12 @@ class CustomDatabase(Database):
         while True:
             if orig_limit is not None:
                 params['limit']=min(orig_limit-yielded,page_size+1)
-            #print "CustomDatabase.paged_view(page_size=%s): %s"%(page_size, str(params))
             
             view = self.view(view_name, **params)
             res = list(view)
                         
-            print (" "*21)+("+"*119)+("> Database.fetch(rows=%s)"%(len(res[0:page_size])))
+            logger.debug((" "*21)+("+"*119)+("> Database.fetch(rows=%s)"%(len(res[0:page_size]))))
             
-            #print "CustomDatabase.paged_view(page_size=%s): FETCHED: %s"%(page_size, str(res))
             for r in res[0:page_size]:
                 if cls:
                     yield cls(r['doc'])
@@ -146,10 +148,9 @@ class CustomViewResults(ViewResults):
         result = self.orig_wrapper(row)
         
         #If the result is a Schema, it is no longer a row. Standard CouchDBKit loses the "key" info
-        #This makes sure the key info is still available as a "private" attribute
+        #This function makes sure the key info is still available as a "private" attribute
         if isinstance(result, schema.Document):            
             result['_key'] = row['key'] 
-                       
         
         return result
    
@@ -236,7 +237,7 @@ class CustomQueryMixin(object):
     """ Mixin that add query methods """
     
     @classmethod
-    def paged_view(cls, view_name, page_size=1000, wrapper=None, dynamic_properties=None,
+    def paged_view(cls, view_name, wrapper=None, dynamic_properties=None,
     wrap_doc=True, classes=None, **params):
         """ Get documents associated view a view.
         Results of view are automatically wrapped
@@ -253,10 +254,17 @@ class CustomQueryMixin(object):
         @return: :class:'simplecouchdb.core.ViewResults' instance. All
         results are wrapped to current document instance.
         """        
+        page_size = params.get("page_size", None)
+        
+        if not page_size:
+            #If no page_size is defined, use the standard view function
+            return cls.view(view_name, wrapper=wrapper, 
+                            dynamic_properties=dynamic_properties,
+                            wrap_doc=wrap_doc, classes=classes, **params)
+        
         db = cls.get_db()
         return GeneratorViewResults(
-            db.paged_view(view_name, page_size=page_size,
-                          dynamic_properties=dynamic_properties, wrap_doc=wrap_doc,
+            db.paged_view(view_name, dynamic_properties=dynamic_properties, wrap_doc=wrap_doc,
                           wrapper=wrapper, schema=classes or cls, **params))
             
 class Document(schema.Document, CustomQueryMixin):
